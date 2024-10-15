@@ -2,13 +2,11 @@ import ..CostFunctions
 export NormalizedEnergy
 
 import ..LinearAlgebraTools, ..QubitOperators
-import ..Parameters, ..Integrations, ..Devices, ..Evolutions
+import ..Parameters, ..Devices, ..Evolutions
 import ..Bases, ..Operators
 
-import ..TrapezoidalIntegrations: TrapezoidalIntegration
-
 """
-    NormalizedEnergy(evolution, device, basis, frame, grid, ψ0, O0; kwargs...)
+    NormalizedEnergy(evolution, device, basis, frame, nsteps, dt, ψ0, O0; kwargs...)
 
 Expectation value of a Hermitian observable.
 
@@ -19,27 +17,16 @@ The statevector is projected onto a binary logical space after time evolution,
 # Arguments
 
 - `evolution::Evolutions.EvolutionType`: the algorithm with which to evolve `ψ0`
-        A sensible choice is `ToggleEvolutions.TOGGLE`
 
 - `device::Devices.DeviceType`: the device, which determines the time-evolution of `ψ0`
 
 - `basis::Bases.BasisType`: the measurement basis
-        ALSO determines the basis which `ψ0` and `O0` are understood to be given in.
-        An intuitive choice is `Bases.OCCUPATION`, aka. the qubits' Z basis.
-        That said, there is some doubt whether, experimentally,
-            projective measurement doesn't actually project on the device's eigenbasis,
-            aka `Bases.DRESSED`.
-        Note that you probably want to rotate `ψ0` and `O0` if you change this argument.
 
 - `frame::Operators.StaticOperator`: the measurement frame
-        Think of this as a time-dependent basis rotation, which is applied to `O0`.
-        A sensible choice is `Operators.STATIC` for the "drive frame",
-            which ensures a zero pulse (no drive) system retains the same energy for any T.
-        Alternatively, use `Operators.UNCOUPLED` for the interaction frame,
-            a (presumably) classically tractable approximation to the drive frame,
-            or `Operators.IDENTITY` to omit the time-dependent rotation entirely.
 
-- `grid::TrapezoidalIntegration`: defines the time integration bounds (eg. from 0 to `T`)
+- `nsteps::Int`: Number of RK4 steps for time evolution.
+
+- `dt::Float64`: Time step for each RK4 integration step.
 
 - `ψ0`: the reference state, living in the physical Hilbert space of `device`.
 
@@ -51,7 +38,8 @@ struct NormalizedEnergy{F} <: CostFunctions.EnergyFunction{F}
     device::Devices.DeviceType
     basis::Bases.BasisType
     frame::Operators.StaticOperator
-    grid::TrapezoidalIntegration
+    nsteps::Int
+    dt::Float64
     ψ0::Vector{Complex{F}}
     O0::Matrix{Complex{F}}
 
@@ -60,16 +48,17 @@ struct NormalizedEnergy{F} <: CostFunctions.EnergyFunction{F}
         device::Devices.DeviceType,
         basis::Bases.BasisType,
         frame::Operators.StaticOperator,
-        grid::TrapezoidalIntegration,
+        nsteps::Int,
+        dt::Float64,
         ψ0::AbstractVector,
         O0::AbstractMatrix,
     )
         # INFER FLOAT TYPE AND CONVERT ARGUMENTS
-        F = real(promote_type(Float16, eltype(O0), eltype(ψ0), eltype(grid)))
+        F = real(promote_type(Float16, eltype(O0), eltype(ψ0), eltype(dt)))
 
         # CREATE OBJECT
         return new{F}(
-            evolution, device, basis, frame, grid,
+            evolution, device, basis, frame, nsteps, dt,
             convert(Array{Complex{F}}, ψ0),
             convert(Array{Complex{F}}, O0),
         )
@@ -83,60 +72,56 @@ function CostFunctions.trajectory_callback(
     En::AbstractVector;
     callback=nothing
 )
-    workbasis = Evolutions.workbasis(fn.evolution)      # BASIS OF CALLBACK ψ
+    workbasis = Evolutions.workbasis(fn.evolution)  # BASIS OF CALLBACK ψ
     U = Devices.basisrotation(fn.basis, workbasis, fn.device)
     π̄ = QubitOperators.localqubitprojectors(fn.device)
     ψ_ = similar(fn.ψ0)
 
-    return (i, t, ψ) -> (
-        ψ_ .= ψ;
-        LinearAlgebraTools.rotate!(U, ψ_);  # ψ_ IS NOW IN MEASUREMENT BASIS
-        LinearAlgebraTools.rotate!(π̄, ψ_);  # ψ_ IS NOW "MEASURED"
+    return (i, t, ψ) -> begin
+        ψ_ .= ψ
+        LinearAlgebraTools.rotate!(U, ψ_)  # ψ_ IS NOW IN MEASUREMENT BASIS
+        LinearAlgebraTools.rotate!(π̄, ψ_)  # ψ_ IS NOW "MEASURED"
         # APPLY FRAME ROTATION TO STATE RATHER THAN OBSERVABLE
-        Devices.evolve!(fn.frame, fn.device, fn.basis, -t, ψ_);
-            # NOTE: Rotating observable only makes sense when t is always the same.
-        E = real(LinearAlgebraTools.expectation(fn.O0, ψ_));
-        F = real(LinearAlgebraTools.expectation(π̄, ψ_));
-        En[i] = E / F;
+        Devices.evolve!(fn.frame, fn.device, fn.basis, -t, ψ_)
+        E = real(LinearAlgebraTools.expectation(fn.O0, ψ_))
+        F = real(LinearAlgebraTools.expectation(π̄, ψ_))
+        En[i] = E / F
         !isnothing(callback) && callback(i, t, ψ)
-    )
+    end
 end
 
 function CostFunctions.cost_function(fn::NormalizedEnergy; callback=nothing)
     # DYNAMICALLY UPDATED STATEVECTOR
     ψ = copy(fn.ψ0)
     # OBSERVABLE, IN MEASUREMENT FRAME
-    T = Integrations.endtime(fn.grid)
+    T = fn.nsteps * fn.dt
     OT = copy(fn.O0); Devices.evolve!(fn.frame, fn.device, fn.basis, T, OT)
     # INCLUDE PROJECTION ONTO COMPUTATIONAL SUBSPACE IN THE MEASUREMENT
     LinearAlgebraTools.rotate!(QubitOperators.localqubitprojectors(fn.device), OT)
     # THE PROJECTION OPERATOR
     π̄ = QubitOperators.localqubitprojectors(fn.device)
 
-    return (x̄) -> (
-        Parameters.bind(fn.device, x̄);
-        Evolutions.evolve(
-            fn.evolution,
-            fn.device,
-            fn.basis,
-            fn.grid,
-            fn.ψ0;
-            result=ψ,
-            callback=callback,
-        );
-        E = real(LinearAlgebraTools.expectation(OT, ψ));
-        F = real(LinearAlgebraTools.expectation(π̄, ψ));
+    return (x̄) -> begin
+        Parameters.bind(fn.device, x̄)
+        t = 0.0
+        for step in 1:fn.nsteps
+            ψ = rk4_step(fn.evolution, fn.device, fn.basis, t, ψ, fn.dt)
+            callback !== nothing && callback(step, t, ψ)
+            t += fn.dt
+        end
+        E = real(LinearAlgebraTools.expectation(OT, ψ))
+        F = real(LinearAlgebraTools.expectation(π̄, ψ))
         E / F
-    )
+    end
 end
 
 function CostFunctions.grad_function_inplace(fn::NormalizedEnergy{F}; ϕ=nothing) where {F}
-    r = Integrations.nsteps(fn.grid)
+    nsteps = fn.nsteps
 
     if isnothing(ϕ)
         return CostFunctions.grad_function_inplace(
             fn;
-            ϕ=Array{F}(undef, r+1, Devices.ngrades(fn.device), 2)
+            ϕ=Array{F}(undef, nsteps + 1, Devices.ngrades(fn.device), 2)
         )
     end
 
@@ -149,7 +134,7 @@ function CostFunctions.grad_function_inplace(fn::NormalizedEnergy{F}; ϕ=nothing
     Ō = Array{eltype(ψ)}(undef, (size(fn.O0)..., 2))
     # FIRST MATRIX: THE OBSERVABLE, IN MEASUREMENT FRAME
     OT = @view(Ō[:,:,1])
-    T = Integrations.endtime(fn.grid)
+    T = nsteps * fn.dt
     OT .= fn.O0; Devices.evolve!(fn.frame, fn.device, fn.basis, T, OT)
     # INCLUDE PROJECTION ONTO COMPUTATIONAL SUBSPACE IN THE MEASUREMENT
     LinearAlgebraTools.rotate!(π̄, OT)
@@ -160,32 +145,30 @@ function CostFunctions.grad_function_inplace(fn::NormalizedEnergy{F}; ϕ=nothing
     ∂E = Array{F}(undef, length(fn))
     ∂N = Array{F}(undef, length(fn))
 
-    return (∇f̄, x̄) -> (
-        Parameters.bind(fn.device, x̄);
-        Evolutions.evolve(
-            fn.evolution,
-            fn.device,
-            fn.basis,
-            fn.grid,
-            fn.ψ0;
-            result=ψ,
-        );
-        E = real(LinearAlgebraTools.expectation(OT, ψ));
-        N = real(LinearAlgebraTools.expectation(π̄, ψ));
+    return (∇f̄, x̄) -> begin
+        Parameters.bind(fn.device, x̄)
+        t = 0.0
+        for step in 1:nsteps
+            ψ = rk4_step(fn.evolution, fn.device, fn.basis, t, ψ, fn.dt)
+            t += fn.dt
+        end
+        E = real(LinearAlgebraTools.expectation(OT, ψ))
+        N = real(LinearAlgebraTools.expectation(π̄, ψ))
 
-        Parameters.bind(fn.device, x̄);
+        Parameters.bind(fn.device, x̄)
         Evolutions.gradientsignals(
             fn.evolution,
             fn.device,
             fn.basis,
-            fn.grid,
+            fn.nsteps,
+            fn.dt,
             fn.ψ0,
             Ō;
-            result=ϕ,   # NOTE: This writes the gradient signal as needed.
-        );
-        ∂E .= Devices.gradient(fn.device, fn.grid, @view(ϕ[:,:,1]));
-        ∂N .= Devices.gradient(fn.device, fn.grid, @view(ϕ[:,:,2]));
+            result=ϕ,  # Writes the gradient signal as needed.
+        )
+        ∂E .= Devices.gradient(fn.device, fn.nsteps, @view(ϕ[:,:,1]))
+        ∂N .= Devices.gradient(fn.device, fn.nsteps, @view(ϕ[:,:,2]))
 
-        ∇f̄ .= (∂E./N) .- (E/N) .* (∂N./N)
-    )
+        ∇f̄ .= (∂E ./ N) .- (E / N) .* (∂N ./ N)
+    end
 end

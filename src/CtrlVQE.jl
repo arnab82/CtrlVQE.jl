@@ -242,7 +242,8 @@ import .ToggleEvolutions: TOGGLE
 
 module DirectEvolutions; include("evols/DirectEvolutions.jl"); end
 import .DirectEvolutions: DIRECT
-
+module evolve_rk4; include("evols/evolve_rk4.jl"); end
+import .evolve_rk4: RK4
 #= TODO (mid): Nick thinks all the evolutions should be promoted to the main module.
 
         I'm not sold.

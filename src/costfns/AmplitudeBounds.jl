@@ -1,7 +1,7 @@
 import ..CostFunctions
 export AmplitudeBound
 
-# NOTE: Implicitly use smooth bounding function.
+# NOTE: Use smooth bounding function.
 wall(u) = exp(u - 1/u)
 grad(u) = exp(u - 1/u) * (1 + 1/u^2)
 
@@ -14,9 +14,9 @@ Smooth bounds for explicitly windowed amplitude parameters.
 - `ΩMAX`: Maximum allowable amplitude on a device.
 - `λ`: Penalty strength.
 - `σ`: Penalty effective width: smaller means steeper.
-- `L`: total number of parameters in cost function.
-- `Ω`: array of indices corresponding to amplitudes (only these are penalized).
-- `paired`: whether or not adjacent pairs of parameters give real+imag parts
+- `L`: Total number of parameters in cost function.
+- `Ω`: Array of indices corresponding to amplitudes (only these are penalized).
+- `paired`: Whether adjacent pairs of parameters give real+imaginary parts.
 
 """
 struct AmplitudeBound{F} <: CostFunctions.CostFunctionType{F}
@@ -36,51 +36,86 @@ struct AmplitudeBound{F} <: CostFunctions.CostFunctionType{F}
         paired::Bool,
     )
         F = promote_type(Float16, eltype(ΩMAX), eltype(λ), eltype(σ))
-        return new{F}(ΩMAX, λ, σ, L, convert(Array{Int}, Ω), paired)
+        return new{F}(ΩMAX, λ, σ, L, convert(Vector{Int}, Ω), paired)
     end
 end
 
 Base.length(fn::AmplitudeBound) = fn.L
 
+# Cost function to calculate the penalty
 function CostFunctions.cost_function(fn::AmplitudeBound)
     if fn.paired
-        Ωα = @view(fn.Ω[1:2:end])
-        Ωβ = @view(fn.Ω[2:2:end])
+        # Ensure fn.Ω has an even number of elements if paired
+        if length(fn.Ω) % 2 != 0
+            error("Length of fn.Ω must be even when paired is true.")
+        end
+        Ωα = @view fn.Ω[1:2:end]
+        Ωβ = @view fn.Ω[2:2:end]
     else
         Ωα = fn.Ω
     end
 
-    return (x̄) -> (
-        total = 0;
-        for i in eachindex(Ωα);
+    return (x̄) -> begin
+        total = 0
+        for i in eachindex(Ωα)
+            # Bounds checking
+            if Ωα[i] > length(x̄) || (fn.paired && Ωβ[i] > length(x̄))
+                error("Index out of bounds in the input parameter array x̄.")
+            end
+
             α = x̄[Ωα[i]]
-            β = fn.paired ? x̄[Ωβ[i]] : zero(α);
-            r = sqrt(α^2 + β^2);
-            u = (r - fn.ΩMAX) / fn.σ;
-            u > 0 && (total += fn.λ * wall(u));
-        end;
+            β = fn.paired ? x̄[Ωβ[i]] : zero(α)
+            r = sqrt(α^2 + β^2)
+
+            # Avoid unnecessary calculations if r is zero
+            if r != 0
+                u = (r - fn.ΩMAX) / fn.σ
+                if u > 0
+                    total += fn.λ * wall(u)
+                end
+            end
+        end
         total
-    )
+    end
 end
 
+# Gradient function for the cost function
 function CostFunctions.grad_function_inplace(fn::AmplitudeBound)
     if fn.paired
-        Ωα = @view(fn.Ω[1:2:end])
-        Ωβ = @view(fn.Ω[2:2:end])
+        # Ensure fn.Ω has an even number of elements if paired
+        if length(fn.Ω) % 2 != 0
+            error("Length of fn.Ω must be even when paired is true.")
+        end
+        Ωα = @view fn.Ω[1:2:end]
+        Ωβ = @view fn.Ω[2:2:end]
     else
         Ωα = fn.Ω
     end
 
-    return (∇f̄, x̄) -> (
-        ∇f̄ .= 0;
-        for i in eachindex(Ωα);
+    return (∇f̄, x̄) -> begin
+        ∇f̄ .= 0  # Reset gradients
+        for i in eachindex(Ωα)
+            # Bounds checking
+            if Ωα[i] > length(x̄) || (fn.paired && Ωβ[i] > length(x̄))
+                error("Index out of bounds in the input parameter array x̄.")
+            end
+
             α = x̄[Ωα[i]]
-            β = fn.paired ? x̄[Ωβ[i]] : zero(α);
-            r = sqrt(α^2 + β^2);
-            u = (r - fn.ΩMAX) / fn.σ;
-            u > 0 && (∇f̄[Ωα[i]] += fn.λ * grad(u) / fn.σ * (α/r));
-            fn.paired && u > 0 && (∇f̄[Ωβ[i]] += fn.λ * grad(u) / fn.σ * (β/r));
-        end;
+            β = fn.paired ? x̄[Ωβ[i]] : zero(α)
+            r = sqrt(α^2 + β^2)
+
+            # Avoid division by zero
+            if r != 0
+                u = (r - fn.ΩMAX) / fn.σ
+                if u > 0
+                    grad_u = fn.λ * grad(u) / fn.σ
+                    ∇f̄[Ωα[i]] += grad_u * (α / r)
+                    if fn.paired
+                        ∇f̄[Ωβ[i]] += grad_u * (β / r)
+                    end
+                end
+            end
+        end
         ∇f̄
-    )
+    end
 end

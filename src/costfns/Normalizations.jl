@@ -2,58 +2,51 @@ import ..CostFunctions
 export Normalization
 
 import ..LinearAlgebraTools, ..QubitOperators
-import ..Parameters, ..Integrations, ..Devices, ..Evolutions
+import ..Parameters, ..Devices, ..Evolutions
 import ..Bases, ..Operators
 
-import ..TrapezoidalIntegrations: TrapezoidalIntegration
-
 """
-    Normalization(evolution, device, basis, grid, ψ0; kwargs...)
+    Normalization(evolution, device, basis, nsteps, dt, ψ0; kwargs...)
 
-The norm of a statevector in a binary logical space.
+The norm of a state vector in a binary logical space.
 
 # Arguments
 
-- `evolution::Evolutions.EvolutionType`: the algorithm with which to evolve `ψ0`
-        A sensible choice is `ToggleEvolutions.TOGGLE`
+- `evolution::Evolutions.EvolutionType`: the algorithm with which to evolve `ψ0`.
 
-- `device::Devices.DeviceType`: the device, which determines the time-evolution of `ψ0`
+- `device::Devices.DeviceType`: the device, which determines the time evolution of `ψ0`.
 
-- `basis::Bases.BasisType`: the measurement basis
-        ALSO determines the basis which `ψ0` is understood to be given in.
-        An intuitive choice is `Bases.OCCUPATION`, aka. the qubits' Z basis.
-        That said, there is some doubt whether, experimentally,
-            projective measurement doesn't actually project on the device's eigenbasis,
-            aka `Bases.DRESSED`.
-        Note that you probably want to rotate `ψ0` if you change this argument.
+- `basis::Bases.BasisType`: the measurement basis. Also determines the basis which `ψ0` is understood to be given in.
+  An intuitive choice is `Bases.OCCUPATION`, aka. the qubits' Z basis. If you change this argument, note that you may want to rotate `ψ0`.
 
-- `grid::TrapezoidalIntegration`: defines the time integration bounds (eg. from 0 to `T`)
+- `nsteps`: Number of steps for time evolution.
 
-- `ψ0`: the reference state, living in the physical Hilbert space of `device`.
+- `dt`: Time step size.
+
+- `ψ0`: The reference state, living in the physical Hilbert space of `device`.
 
 """
 struct Normalization{F} <: CostFunctions.EnergyFunction{F}
     evolution::Evolutions.EvolutionType
     device::Devices.DeviceType
     basis::Bases.BasisType
-    grid::TrapezoidalIntegration
+    nsteps::Int
+    dt::F
     ψ0::Vector{Complex{F}}
 
     function Normalization(
         evolution::Evolutions.EvolutionType,
         device::Devices.DeviceType,
         basis::Bases.BasisType,
-        grid::TrapezoidalIntegration,
+        nsteps::Int,
+        dt::Real,
         ψ0::AbstractVector,
     )
-        # INFER FLOAT TYPE AND CONVERT ARGUMENTS
-        F = real(promote_type(Float16, eltype(ψ0), eltype(grid)))
+        # Infer float type and convert arguments
+        F = promote_type(Float16, eltype(ψ0), dt)
 
-        # CREATE OBJECT
-        return new{F}(
-            evolution, device, basis, grid,
-            convert(Array{Complex{F}}, ψ0),
-        )
+        # Create object
+        return new{F}(evolution, device, basis, nsteps, F(dt), convert(Array{Complex{F}}, ψ0))
     end
 end
 
@@ -64,64 +57,64 @@ function CostFunctions.trajectory_callback(
     F::AbstractVector;
     callback=nothing
 )
-    workbasis = Evolutions.workbasis(fn.evolution)      # BASIS OF CALLBACK ψ
+    workbasis = Evolutions.workbasis(fn.evolution)  # Basis of callback ψ
     U = Devices.basisrotation(fn.basis, workbasis, fn.device)
     π̄ = QubitOperators.localqubitprojectors(fn.device)
     ψ_ = similar(fn.ψ0)
 
-    return (i, t, ψ) -> (
-        ψ_ .= ψ;
-        LinearAlgebraTools.rotate!(U, ψ_);  # ψ_ IS NOW IN MEASUREMENT BASIS
-        F[i] = real(LinearAlgebraTools.expectation(π̄, ψ_));
+    return (i, t, ψ) -> begin
+        ψ_ .= ψ
+        LinearAlgebraTools.rotate!(U, ψ_)  # ψ_ is now in the measurement basis
+        F[i] = real(LinearAlgebraTools.expectation(π̄, ψ_))
         !isnothing(callback) && callback(i, t, ψ)
-    )
+    end
 end
 
+
 function CostFunctions.cost_function(fn::Normalization; callback=nothing)
-    # DYNAMICALLY UPDATED STATEVECTOR
+    # Dynamically updated state vector
     ψ = copy(fn.ψ0)
-    # OBSERVABLE - IT'S THE PROJECTION OPERATOR
     π̄ = QubitOperators.localqubitprojectors(fn.device)
 
-    return (x̄) -> (
-        Parameters.bind(fn.device, x̄);
-        Evolutions.evolve(
-            fn.evolution,
-            fn.device,
-            fn.basis,
-            fn.grid,
-            fn.ψ0;
-            result=ψ,
-            callback=callback,
-        );
-        real(LinearAlgebraTools.expectation(π̄, ψ))
-    )
+    return (x̄) -> begin
+        Parameters.bind(fn.device, x̄)
+        t = 0.0
+
+        # Evolve using RK4
+        for i in 1:fn.nsteps
+            ψ = rk4_step(fn.evolution, fn.device, fn.basis, t, ψ, fn.dt)
+            callback !== nothing && callback(i, t, ψ)
+            t += fn.dt
+        end
+
+        return real(LinearAlgebraTools.expectation(π̄, ψ))
+    end
 end
 
 function CostFunctions.grad_function_inplace(fn::Normalization{F}; ϕ=nothing) where {F}
-    r = Integrations.nsteps(fn.grid)
-
     if isnothing(ϕ)
         return CostFunctions.grad_function_inplace(
             fn;
-            ϕ=Array{F}(undef, r+1, Devices.ngrades(fn.device))
+            ϕ=Array{F}(undef, fn.nsteps + 1, Devices.ngrades(fn.device))
         )
     end
 
-    # OBSERVABLE - IT'S THE PROJECTION OPERATOR
+    # Observable - It's the projection operator
     Π = QubitOperators.qubitprojector(fn.device)
 
-    return (∇f̄, x̄) -> (
-        Parameters.bind(fn.device, x̄);
+    return (∇f̄, x̄) -> begin
+        Parameters.bind(fn.device, x̄)
         Evolutions.gradientsignals(
             fn.evolution,
             fn.device,
             fn.basis,
-            fn.grid,
+            fn.nsteps,
+            fn.dt,
             fn.ψ0,
             Π;
-            result=ϕ,   # NOTE: This writes the gradient signal as needed.
-        );
-        ∇f̄ .= Devices.gradient(fn.device, fn.grid, ϕ)
-    )
+            result=ϕ  # This writes the gradient signal as needed.
+        )
+        ∇f̄ .= Devices.gradient(fn.device, fn.nsteps, ϕ)
+        return ∇f̄
+    end
 end

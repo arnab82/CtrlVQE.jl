@@ -191,3 +191,54 @@ Not really sure how that works.
 =#
 
 Base.eltype(::IntegrationType{F}) where {F} = F
+
+export RK4Integration
+
+"""
+    RK4Integration(t0::F, tf::F, r::Int)
+
+Grid for 4th-order Runge-Kutta (RK4) time integration.
+
+# Arguments
+- `t0`, `tf`: Start and end times of the integral.
+- `r`: The number of time steps (number of lattice points is `r+1`).
+
+# Explanation
+
+This grid uses a uniform time step size for the RK4 integration method.
+The total time interval is divided into `r` steps.
+"""
+struct RK4Integration{F} <: Integrations.IntegrationType{F}
+    t0::F  # Start time
+    tf::F  # End time
+    r::Int # Number of time steps
+end
+
+# Define the start time
+Integrations.starttime(grid::RK4Integration) = grid.t0
+
+# Define the end time
+Integrations.endtime(grid::RK4Integration) = grid.tf
+
+# Number of steps in the grid
+Integrations.nsteps(grid::RK4Integration) = grid.r
+
+# Calculate the uniform time step size
+function Integrations.stepsize(grid::RK4Integration)
+    return (grid.tf - grid.t0) / grid.r
+end
+
+# Define the time at the ith step
+function Integrations.timeat(grid::RK4Integration, i::Int)
+    return grid.t0 + Integrations.stepsize(grid) * i
+end
+
+# For RK4, each step has the same size
+function Integrations.stepat(grid::RK4Integration, i::Int)
+    return Integrations.stepsize(grid)
+end
+
+# Reverse the integration grid
+function Base.reverse(grid::RK4Integration)
+    return RK4Integration(grid.tf, grid.t0, grid.r)
+end
